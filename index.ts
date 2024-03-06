@@ -1,18 +1,12 @@
-import {
-  BaseContract,
-  Contract,
-  ContractFactory,
-  Signer,
-  Fragment,
-  ethers,
-} from "ethers";
+import { BaseContract, Contract, Signer, Fragment, ethers } from "ethers";
 import type { JsonFragment } from "@ethersproject/abi";
 
 import DoppelgangerContract from "./artifacts/contracts/Doppelganger.sol/Doppelganger.json";
-import type { JsonRpcProvider } from "@ethersproject/providers";
+import { JsonRpcProvider } from "@ethersproject/providers";
 
 type ABI = string | Array<Fragment | JsonFragment | string>;
 
+////--------------interfaces-----------------////
 interface StubInterface {
   returns(...args: any): StubInterface;
   reverts(): StubInterface;
@@ -20,15 +14,16 @@ interface StubInterface {
   withArgs(...args: any[]): StubInterface;
 }
 
-export interface MockContract<T extends BaseContract = BaseContract>
-  extends Contract {
+interface Mock {
   mock: {
-    [key in keyof T["functions"] | "receive"]: StubInterface;
+    [key in keyof BaseContract["fallback"] | "receive"]: StubInterface;
   };
+}
+interface CallStactic {
   call(
-    ...params: any[],
     contract: Contract,
-    functionName: string
+    functionName: string,
+    ...params: any[]
   ): Promise<any>;
   staticcall(
     contract: Contract,
@@ -36,6 +31,11 @@ export interface MockContract<T extends BaseContract = BaseContract>
     ...params: any[]
   ): Promise<any>;
 }
+/////------------------------------------------------------////
+
+export type MockContract<T extends BaseContract = BaseContract> = Contract &
+  CallStactic &
+  Mock;
 
 class Stub implements StubInterface {
   callData: string;
@@ -48,7 +48,7 @@ class Stub implements StubInterface {
     private encoder: ethers.AbiCoder,
     private func: ethers.FunctionFragment
   ) {
-    this.callData = mockContract.interface.getSighash(func);
+    this.callData = func.selector;
   }
 
   private err(reason: string): never {
@@ -67,11 +67,11 @@ class Stub implements StubInterface {
     // if there no calls then this is the first call and we need to use mockReturns to override the queue
     if (this.stubCalls.length === 0) {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__mockReturns(this.callData, encoded);
+        await this.mockContract.__hardhat__mockReturns(this.callData, encoded);
       });
     } else {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__queueReturn(this.callData, encoded);
+        await this.mockContract.__hardhat__queueReturn(this.callData, encoded);
       });
     }
     return this;
@@ -83,14 +83,14 @@ class Stub implements StubInterface {
     // if there no calls then this is the first call and we need to use mockReturns to override the queue
     if (this.stubCalls.length === 0) {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__mockReverts(
+        await this.mockContract.__hardhat__mockReverts(
           this.callData,
           "Mock revert"
         );
       });
     } else {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__queueRevert(
+        await this.mockContract.__hardhat__queueRevert(
           this.callData,
           "Mock revert"
         );
@@ -106,11 +106,11 @@ class Stub implements StubInterface {
     // if there no calls then this is the first call and we need to use mockReturns to override the queue
     if (this.stubCalls.length === 0) {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__mockReverts(this.callData, reason);
+        await this.mockContract.__hardhat__mockReverts(this.callData, reason);
       });
     } else {
       this.stubCalls.push(async () => {
-        await this.mockContract.__waffle__queueRevert(this.callData, reason);
+        await this.mockContract.__hardhat__queueRevert(this.callData, reason);
       });
     }
     this.revertSet = true;
@@ -155,7 +155,16 @@ type DeployOptions = {
 async function deploy(signer: Signer, options?: DeployOptions) {
   if (options) {
     const { address, override } = options;
-    const provider = signer.provider as JsonRpcProvider;
+
+    let provider: JsonRpcProvider;
+    if (
+      signer.provider !== null &&
+      signer.provider instanceof JsonRpcProvider
+    ) {
+      provider = signer.provider as JsonRpcProvider;
+    } else {
+      provider = new JsonRpcProvider();
+    }
     if (!override && (await provider.getCode(address)) !== "0x") {
       throw new Error(
         `${address} already contains a contract. ` +
@@ -164,9 +173,9 @@ async function deploy(signer: Signer, options?: DeployOptions) {
     }
     if ((provider as any)._hardhatNetwork) {
       if (
-        await provider.send("hardhat_setCode", [
+        await provider?.send("hardhat_setCode", [
           address,
-          "0x" + DoppelgangerContract.evm.deployedBytecode.object,
+          DoppelgangerContract.deployedBytecode,
         ])
       ) {
         return new Contract(address, DoppelgangerContract.abi, signer);
@@ -175,29 +184,38 @@ async function deploy(signer: Signer, options?: DeployOptions) {
       if (
         await provider.send("evm_setAccountCode", [
           address,
-          "0x" + DoppelgangerContract.evm.deployedBytecode.object,
+          DoppelgangerContract.deployedBytecode,
         ])
       ) {
         return new Contract(address, DoppelgangerContract.abi, signer);
       } else throw new Error(`Couldn't deploy at ${address}`);
     }
   }
-  const factory = new ContractFactory(
+  const factory = new ethers.ContractFactory(
     DoppelgangerContract.abi,
     DoppelgangerContract.bytecode,
     signer
   );
-  return factory.deploy();
+  const address = (await factory.deploy()).target;
+  const getContract = new ethers.Contract(
+    address,
+    DoppelgangerContract.abi,
+    signer
+  );
+  return getContract;
 }
 
 function createMock<T extends BaseContract>(
   abi: ABI,
   mockContractInstance: Contract
 ): MockContract<T>["mock"] {
-  const { functions } = new ethers.Interface(abi);
+  const functions = new ethers.Interface(abi);
   const encoder = new ethers.AbiCoder();
+  const fallbacks: ethers.FunctionFragment[] = [];
 
-  const mockedAbi = Object.values(functions).reduce((acc, func) => {
+  functions.forEachFunction((func) => fallbacks.push(func));
+
+  const mockedAbi = Object.values(fallbacks).reduce((acc, func) => {
     const stubbed = new Stub(
       mockContractInstance as MockContract,
       encoder,
@@ -217,9 +235,10 @@ function createMock<T extends BaseContract>(
     withArgs: () => {
       throw new Error("Receive function return is not implemented.");
     },
-    reverts: () => mockContractInstance.__waffle__receiveReverts("Mock Revert"),
+    reverts: () =>
+      mockContractInstance.__hardhat__receiveReverts("Mock Revert"),
     revertsWithReason: (reason: string) =>
-      mockContractInstance.__waffle__receiveReverts(reason),
+      mockContractInstance.__hardhat__receiveReverts(reason),
   };
 
   return mockedAbi;
@@ -234,7 +253,7 @@ export async function deployMockContract<T extends BaseContract = BaseContract>(
 
   const mock = createMock<T>(abi, mockContractInstance);
   const mockedContract = new Contract(
-    mockContractInstance.address,
+    mockContractInstance.target,
     abi,
     signer
   ) as MockContract<T>;
@@ -247,24 +266,19 @@ export async function deployMockContract<T extends BaseContract = BaseContract>(
     functionName: string,
     ...params: any[]
   ) => {
-    let func: ethers.FunctionFragment =
-      contract.interface.functions[functionName];
-    if (!func) {
-      func = Object.values(contract.interface.functions).find(
-        (f) => f.name === functionName
-      ) as ethers.FunctionFragment;
-    }
+    let func: ethers.FunctionFragment | null =
+      contract.interface.getFunction(functionName);
     if (!func) {
       throw new Error(`Unknown function ${functionName}`);
     }
     if (!func.outputs) {
       throw new Error("Cannot staticcall function with no outputs");
     }
-    const tx = await contract.populateTransaction[functionName](...params);
+    const tx = await contract.populateTransaction(...params);
     const data = tx.data;
     let result;
-    const returnValue = await mockContractInstance.__waffle__staticcall(
-      contract.address,
+    const returnValue = await mockContractInstance.__hardhat__staticcall(
+      contract.target,
       data
     );
     result = encoder.decode(func.outputs, returnValue);
@@ -279,9 +293,9 @@ export async function deployMockContract<T extends BaseContract = BaseContract>(
     functionName: string,
     ...params: any[]
   ) => {
-    const tx = await contract.populateTransaction[functionName](...params);
+    const tx = await contract.populateTransaction(...params);
     const data = tx.data;
-    return mockContractInstance.__waffle__call(contract.address, data);
+    return mockContractInstance.__hardhat__call(contract.target, data);
   };
 
   return mockedContract;
